@@ -35,4 +35,19 @@ docker run --rm --network host netid-lxc:latest 192.168.1.0/24
 
 ## Proxmox LXC notes
 
-For Proxmox, deploy a Debian-based LXC container with the `iputils-ping` package installed, copy the built binary into the container, and run it with the target CIDR argument. This repository also provides a container image build path for the same binary.
+For Proxmox, deploy a Debian-based LXC container and run the LXC installer script:
+
+```bash
+chmod +x /root/NetID-LXC/scripts/install-lxc.sh
+/root/NetID-LXC/scripts/install-lxc.sh
+```
+
+The script installs Rust, clones the repository into `/opt/netid-lxc`, builds the binary, installs it to `/usr/local/bin/netid-lxc`, and creates a systemd service that runs it on startup.
+
+For manual execution inside the container:
+
+```bash
+/usr/local/bin/netid-lxc 192.168.1.0/24
+```
+
+See [lxc-proxmox.md](lxc-proxmox.md) for container settings and troubleshooting.
