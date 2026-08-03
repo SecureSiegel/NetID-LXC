@@ -24,6 +24,7 @@ A quiet Rust-based Linux LAN inventory tool designed for Proxmox LXC environment
 7. Confidence-scored device classification
 
 The program prints stage progress so you can see active interfaces, estimated runtime, and keep-alive progress while passive listening is running.
+At completion, the terminal prints an easy-to-read device table and writes full JSON into an output directory.
 
 ## Output schema (per device)
 
@@ -55,6 +56,14 @@ cargo build --release
 
 Argument is listen duration in seconds, capped to 60. If omitted, default is 30.
 
+Optional second argument sets JSON output directory:
+
+```bash
+./target/release/netid-lxc 30 ./output
+```
+
+Default output directory is `/var/lib/netid-lxc/output` with fallback to `./output` if the preferred path is not writable.
+
 ## Container build
 
 ```bash
@@ -64,7 +73,7 @@ docker build -t netid-lxc:latest .
 Run the container in host network mode:
 
 ```bash
-docker run --rm --network host netid-lxc:latest 30
+docker run --rm --network host -v $(pwd)/output:/output netid-lxc:latest 30 /output
 ```
 
 ## Proxmox LXC notes
@@ -81,7 +90,7 @@ The script installs Rust, clones the repository into `/opt/netid-lxc`, builds th
 For manual execution inside the container:
 
 ```bash
-/usr/local/bin/netid-lxc 30
+/usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output
 ```
 
 ## Deploy as a Proxmox container (LXC)
@@ -119,8 +128,13 @@ journalctl -u netid-lxc.service -n 100 --no-pager
 7. Optional manual run (30 second passive listen):
 
 ```bash
-/usr/local/bin/netid-lxc 30
+/usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output
 ```
+
+JSON output files:
+
+- `/var/lib/netid-lxc/output/latest.json`
+- `/var/lib/netid-lxc/output/run-YYYYMMDD-HHMMSS.json`
 
 ## Update an existing Proxmox container
 

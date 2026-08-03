@@ -38,16 +38,28 @@ chmod +x /root/NetID-LXC/scripts/install-lxc.sh
 ## Run manually
 
 ```bash
-/usr/local/bin/netid-lxc 30
+/usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output
 ```
 
 Argument is passive listen time in seconds (max 60).
+Second argument is output directory for JSON files.
+
+Terminal output is a readable table. JSON is saved as:
+
+- `/var/lib/netid-lxc/output/latest.json`
+- `/var/lib/netid-lxc/output/run-YYYYMMDD-HHMMSS.json`
 
 ## Run via systemd
 
 ```bash
 systemctl start netid-lxc.service
 systemctl status netid-lxc.service
+```
+
+To read recent table output from the service:
+
+```bash
+journalctl -u netid-lxc.service -n 200 --no-pager
 ```
 
 ## Update an existing Proxmox container

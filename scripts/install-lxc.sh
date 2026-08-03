@@ -40,7 +40,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/netid-lxc 30
+ExecStart=/usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output
 Restart=on-failure
 WorkingDirectory=/opt/netid-lxc
 

@@ -15,6 +15,13 @@ const DEFAULT_LISTEN_SECONDS: u64 = 30;
 const MAX_LISTEN_SECONDS: u64 = 60;
 const MAX_RDNS_TARGETS: usize = 24;
 const RDNS_CONCURRENCY: usize = 4;
+const DEFAULT_OUTPUT_DIR: &str = "/var/lib/netid-lxc/output";
+
+#[derive(Debug, Clone)]
+struct RuntimeConfig {
+    listen_seconds: u64,
+    output_dir: PathBuf,
+}
 
 #[derive(Debug, Clone)]
 struct InterfaceInfo {
@@ -202,9 +209,12 @@ impl Inventory {
 
 fn main() {
     let started = Instant::now();
-    let listen_seconds = parse_listen_seconds();
+    let config = parse_runtime_config();
+    let listen_seconds = config.listen_seconds;
+    let output_dir = ensure_output_dir(&config.output_dir);
 
     println!("NetID-LXC passive inventory run started at {}", now_iso());
+    println!("Inventory output directory: {}", output_dir.display());
 
     println!("[1/8] Discovering UP interfaces and directly-connected IPv4 subnets...");
     let interfaces = discover_interfaces();
@@ -382,9 +392,16 @@ fn main() {
     let mut records = inventory.records();
     records.sort_by_key(|device| device.ips.first().cloned().unwrap_or_default());
 
-    println!("[8/8] Writing inventory output...");
-    let output = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
-    println!("{output}");
+    println!("[8/8] Rendering table and writing JSON output...");
+    print_inventory_table(&records);
+    let (latest_path, run_path) = write_inventory_json(&records, &output_dir)
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to write JSON output: {error}");
+            std::process::exit(1);
+        });
+
+    println!("Saved latest inventory: {}", latest_path.display());
+    println!("Saved run snapshot: {}", run_path.display());
 
     println!(
         "Run complete in {:.1}s. Devices discovered: {}",
@@ -393,14 +410,157 @@ fn main() {
     );
 }
 
-fn parse_listen_seconds() -> u64 {
+fn parse_runtime_config() -> RuntimeConfig {
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() < 2 {
-        return DEFAULT_LISTEN_SECONDS;
+    let listen_seconds = if args.len() < 2 {
+        DEFAULT_LISTEN_SECONDS
+    } else {
+        let parsed = args[1].parse::<u64>().unwrap_or(DEFAULT_LISTEN_SECONDS);
+        parsed.min(MAX_LISTEN_SECONDS)
+    };
+
+    let output_dir = if let Some(arg_path) = args.get(2) {
+        PathBuf::from(arg_path)
+    } else if let Ok(env_path) = std::env::var("NETID_LXC_OUTPUT_DIR") {
+        PathBuf::from(env_path)
+    } else {
+        PathBuf::from(DEFAULT_OUTPUT_DIR)
+    };
+
+    RuntimeConfig {
+        listen_seconds,
+        output_dir,
+    }
+}
+
+fn ensure_output_dir(preferred: &Path) -> PathBuf {
+    if fs::create_dir_all(preferred).is_ok() {
+        return preferred.to_path_buf();
     }
 
-    let parsed = args[1].parse::<u64>().unwrap_or(DEFAULT_LISTEN_SECONDS);
-    parsed.min(MAX_LISTEN_SECONDS)
+    let fallback = PathBuf::from("./output");
+    let _ = fs::create_dir_all(&fallback);
+    fallback
+}
+
+fn write_inventory_json(records: &[DeviceRecord], output_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let json = serde_json::to_string_pretty(records)
+        .map_err(|error| format!("unable to serialize JSON: {error}"))?;
+
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let latest = output_dir.join("latest.json");
+    let run = output_dir.join(format!("run-{timestamp}.json"));
+
+    fs::write(&latest, &json)
+        .map_err(|error| format!("unable to write {}: {error}", latest.display()))?;
+    fs::write(&run, &json)
+        .map_err(|error| format!("unable to write {}: {error}", run.display()))?;
+
+    Ok((latest, run))
+}
+
+fn print_inventory_table(records: &[DeviceRecord]) {
+    println!("");
+    println!("Discovered Devices");
+
+    let headers = [
+        "IP",
+        "MAC",
+        "HOSTNAME",
+        "VENDOR",
+        "CATEGORY",
+        "CONF",
+        "IFACE",
+        "SERVICES",
+    ];
+
+    let mut rows = Vec::new();
+    for record in records {
+        let ip = pick_first_or_dash(&record.ips);
+        let mac = pick_first_or_dash(&record.macs);
+        let hostname = pick_first_or_dash(&record.observed_hostnames);
+        let vendor = record.vendor.clone().unwrap_or_else(|| "-".to_string());
+        let category = record.category.clone();
+        let confidence = record.confidence.clone();
+        let iface = record.interface.clone().unwrap_or_else(|| "-".to_string());
+
+        let mut services = record.observed_mdns_services.clone();
+        services.extend(record.observed_ssdp_services.clone());
+        services.sort();
+        services.dedup();
+        let service_text = if services.is_empty() {
+            "-".to_string()
+        } else {
+            services.join(",")
+        };
+
+        rows.push(vec![ip, mac, hostname, vendor, category, confidence, iface, service_text]);
+    }
+
+    let max_widths = [15usize, 17, 24, 18, 18, 6, 10, 26];
+    let mut widths = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| h.len().min(max_widths[i]))
+        .collect::<Vec<_>>();
+
+    for row in &rows {
+        for (i, value) in row.iter().enumerate() {
+            widths[i] = widths[i].max(value.len().min(max_widths[i]));
+        }
+    }
+
+    println!("{}", render_row(&headers.map(|h| h.to_string()), &widths));
+    println!("{}", render_separator(&widths));
+
+    for row in rows {
+        let clipped = row
+            .iter()
+            .enumerate()
+            .map(|(i, value)| clip(value, max_widths[i]))
+            .collect::<Vec<_>>();
+        println!("{}", render_row(&clipped, &widths));
+    }
+    println!("");
+}
+
+fn render_row(values: &[String], widths: &[usize]) -> String {
+    let mut out = String::new();
+    out.push('|');
+    for (value, width) in values.iter().zip(widths.iter()) {
+        out.push(' ');
+        out.push_str(&format!("{value:<width$}", width = *width));
+        out.push(' ');
+        out.push('|');
+    }
+    out
+}
+
+fn render_separator(widths: &[usize]) -> String {
+    let mut out = String::new();
+    out.push('+');
+    for width in widths {
+        out.push_str(&"-".repeat(width + 2));
+        out.push('+');
+    }
+    out
+}
+
+fn clip(value: &str, max: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max {
+        return value.to_string();
+    }
+    if max <= 3 {
+        return value.chars().take(max).collect::<String>();
+    }
+    let mut clipped = value.chars().take(max - 3).collect::<String>();
+    clipped.push_str("...");
+    clipped
+}
+
+fn pick_first_or_dash(values: &[String]) -> String {
+    values.first().cloned().unwrap_or_else(|| "-".to_string())
 }
 
 fn estimate_runtime_seconds(listen_seconds: u64, interface_count: usize) -> u64 {
