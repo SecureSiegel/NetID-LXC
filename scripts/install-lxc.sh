@@ -3,10 +3,10 @@ set -euo pipefail
 
 if ! command -v curl >/dev/null 2>&1; then
   apt-get update
-  apt-get install -y curl git build-essential iputils-ping pkg-config
+  apt-get install -y curl git build-essential iproute2 pkg-config
 else
   apt-get update
-  apt-get install -y git build-essential iputils-ping pkg-config
+  apt-get install -y git build-essential iproute2 pkg-config
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -40,7 +40,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/netid-lxc 192.168.1.0/24
+ExecStart=/usr/local/bin/netid-lxc 30
 Restart=on-failure
 WorkingDirectory=/opt/netid-lxc
 

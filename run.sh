@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NETWORK="${1:-192.168.1.0/24}"
-exec /usr/local/bin/netid-lxc "$NETWORK"
+LISTEN_SECONDS="${1:-30}"
+exec /usr/local/bin/netid-lxc "$LISTEN_SECONDS"
