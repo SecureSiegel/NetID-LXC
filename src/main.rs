@@ -3,8 +3,8 @@ use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -16,11 +16,17 @@ const MAX_LISTEN_SECONDS: u64 = 60;
 const MAX_RDNS_TARGETS: usize = 24;
 const RDNS_CONCURRENCY: usize = 4;
 const DEFAULT_OUTPUT_DIR: &str = "/var/lib/netid-lxc/output";
+const DEFAULT_BANNER_TIMEOUT_MS: u64 = 500;
+const MAX_BANNER_TIMEOUT_MS: u64 = 3000;
+const MAX_BANNER_TARGETS: usize = 64;
+const MAX_BANNER_PORTS: usize = 24;
 
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
     listen_seconds: u64,
     output_dir: PathBuf,
+    banner_ports: Vec<u16>,
+    banner_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -74,10 +80,12 @@ struct DeviceRecord {
     observed_instances: Vec<String>,
     observed_mdns_services: Vec<String>,
     observed_ssdp_services: Vec<String>,
+    observed_tcp_banners: Vec<String>,
+    observed_open_ports: Vec<u16>,
+    observed_service_hints: Vec<String>,
+    observed_identity_hints: Vec<String>,
     vendor: Option<String>,
     category: String,
-    confidence: String,
-    confidence_sources: Vec<String>,
     first_seen: String,
     last_seen: String,
 }
@@ -91,6 +99,10 @@ struct DeviceBuilder {
     instances: HashSet<String>,
     mdns_services: HashSet<String>,
     ssdp_services: HashSet<String>,
+    tcp_banners: HashSet<String>,
+    open_ports: HashSet<u16>,
+    service_hints: HashSet<String>,
+    identity_hints: HashSet<String>,
     vendor: Option<String>,
     sources: HashSet<String>,
     first_seen: String,
@@ -107,6 +119,10 @@ impl DeviceBuilder {
             instances: HashSet::new(),
             mdns_services: HashSet::new(),
             ssdp_services: HashSet::new(),
+            tcp_banners: HashSet::new(),
+            open_ports: HashSet::new(),
+            service_hints: HashSet::new(),
+            identity_hints: HashSet::new(),
             vendor: None,
             sources: HashSet::new(),
             first_seen: now.to_string(),
@@ -119,7 +135,7 @@ impl DeviceBuilder {
     }
 
     fn to_record(mut self) -> DeviceRecord {
-        let (category, confidence, confidence_sources) = classify_device(&self);
+        let category = infer_category(&self);
 
         let mut ips = self
             .ips
@@ -143,6 +159,18 @@ impl DeviceBuilder {
         let mut observed_ssdp_services = self.ssdp_services.drain().collect::<Vec<_>>();
         observed_ssdp_services.sort();
 
+        let mut observed_tcp_banners = self.tcp_banners.drain().collect::<Vec<_>>();
+        observed_tcp_banners.sort();
+
+        let mut observed_open_ports = self.open_ports.drain().collect::<Vec<_>>();
+        observed_open_ports.sort_unstable();
+
+        let mut observed_service_hints = self.service_hints.drain().collect::<Vec<_>>();
+        observed_service_hints.sort();
+
+        let mut observed_identity_hints = self.identity_hints.drain().collect::<Vec<_>>();
+        observed_identity_hints.sort();
+
         DeviceRecord {
             ips,
             macs,
@@ -151,10 +179,12 @@ impl DeviceBuilder {
             observed_instances,
             observed_mdns_services,
             observed_ssdp_services,
+            observed_tcp_banners,
+            observed_open_ports,
+            observed_service_hints,
+            observed_identity_hints,
             vendor: self.vendor,
             category,
-            confidence,
-            confidence_sources,
             first_seen: self.first_seen,
             last_seen: self.last_seen,
         }
@@ -216,7 +246,7 @@ fn main() {
     println!("NetID-LXC passive inventory run started at {}", now_iso());
     println!("Inventory output directory: {}", output_dir.display());
 
-    println!("[1/8] Discovering UP interfaces and directly-connected IPv4 subnets...");
+    println!("[1/9] Discovering UP interfaces and directly-connected IPv4 subnets...");
     let interfaces = discover_interfaces();
     if interfaces.is_empty() {
         eprintln!("No UP interfaces with IPv4 addresses found.");
@@ -235,13 +265,19 @@ fn main() {
         );
     }
 
-    let estimated_seconds = estimate_runtime_seconds(listen_seconds, interfaces.len());
+    let estimated_seconds = estimate_runtime_seconds(
+        listen_seconds,
+        interfaces.len(),
+        config.banner_ports.len(),
+    );
     println!(
-        "Estimated runtime: ~{}s (passive listen {}s, reverse DNS capped, no active probing)",
-        estimated_seconds, listen_seconds
+        "Estimated runtime: ~{}s (passive listen {}s, reverse DNS capped, optional banner probe ports={})",
+        estimated_seconds,
+        listen_seconds,
+        config.banner_ports.len()
     );
 
-    println!("[2/8] Reading IPv4 neighbor/ARP tables...");
+    println!("[2/9] Reading IPv4 neighbor/ARP tables...");
     let mut neighbors = collect_neighbors(false);
     if neighbors.len() < 2 {
         println!("  Neighbor table sparse, taking a light second snapshot...");
@@ -256,15 +292,15 @@ fn main() {
     }
     println!("  Collected {} neighbor entries", neighbors.len());
 
-    println!("[3/8] Loading offline OUI vendor database...");
+    println!("[3/9] Loading offline OUI vendor database...");
     let oui_db = load_oui_database();
     println!("  Loaded {} OUI prefixes", oui_db.len());
 
-    println!("[4/8] Parsing local DHCP leases/log hints...");
+    println!("[4/9] Parsing local DHCP leases/log hints...");
     let dhcp_observations = collect_dhcp_observations();
     println!("  Parsed {} DHCP observations", dhcp_observations.len());
 
-    println!("[5/8] Passive discovery (mDNS + optional SSDP) for up to {}s...", listen_seconds);
+    println!("[5/9] Passive discovery (mDNS + optional SSDP) for up to {}s...", listen_seconds);
     let (mdns_observations, ssdp_observations) = passive_service_listen(listen_seconds);
     println!(
         "  Captured {} mDNS hints and {} SSDP hints",
@@ -353,7 +389,7 @@ fn main() {
         }
     }
 
-    println!("[6/8] Limited reverse DNS lookup for discovered IPs...");
+    println!("[6/9] Limited reverse DNS lookup for discovered IPs...");
     let rdns_hints = reverse_dns_hints(
         &inventory
             .devices
@@ -388,11 +424,29 @@ fn main() {
         }
     }
 
-    println!("[7/8] Classifying devices with confidence scoring...");
+    println!("[7/9] Optional TCP banner enrichment...");
+    if config.banner_ports.is_empty() {
+        println!("  Skipped (no --banner-ports provided)");
+    } else {
+        let stats = collect_tcp_banners(
+            &mut inventory,
+            &config.banner_ports,
+            Duration::from_millis(config.banner_timeout_ms),
+        );
+        println!(
+            "  Banner probe complete: targets={} attempts={} banners={} timeout={}ms",
+            stats.targets,
+            stats.attempts,
+            stats.banners,
+            config.banner_timeout_ms
+        );
+    }
+
+    println!("[8/9] Classifying device categories...");
     let mut records = inventory.records();
     records.sort_by_key(|device| device.ips.first().cloned().unwrap_or_default());
 
-    println!("[8/8] Rendering table and writing JSON output...");
+    println!("[9/9] Rendering table and writing JSON output...");
     print_inventory_table(&records);
     let (latest_path, run_path) = write_inventory_json(&records, &output_dir)
         .unwrap_or_else(|error| {
@@ -412,14 +466,52 @@ fn main() {
 
 fn parse_runtime_config() -> RuntimeConfig {
     let args = std::env::args().collect::<Vec<_>>();
-    let listen_seconds = if args.len() < 2 {
+    let mut positional = Vec::new();
+    let mut banner_ports = Vec::new();
+    let mut banner_timeout_ms = DEFAULT_BANNER_TIMEOUT_MS;
+
+    let mut index = 1usize;
+    while index < args.len() {
+        let current = &args[index];
+        if current == "--banner-ports" {
+            if let Some(next) = args.get(index + 1) {
+                banner_ports = parse_ports_csv(next);
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = current.strip_prefix("--banner-ports=") {
+            banner_ports = parse_ports_csv(value);
+            index += 1;
+            continue;
+        }
+        if current == "--banner-timeout-ms" {
+            if let Some(next) = args.get(index + 1) {
+                let parsed = next.parse::<u64>().unwrap_or(DEFAULT_BANNER_TIMEOUT_MS);
+                banner_timeout_ms = parsed.min(MAX_BANNER_TIMEOUT_MS).max(100);
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = current.strip_prefix("--banner-timeout-ms=") {
+            let parsed = value.parse::<u64>().unwrap_or(DEFAULT_BANNER_TIMEOUT_MS);
+            banner_timeout_ms = parsed.min(MAX_BANNER_TIMEOUT_MS).max(100);
+            index += 1;
+            continue;
+        }
+
+        positional.push(current.clone());
+        index += 1;
+    }
+
+    let listen_seconds = if positional.is_empty() {
         DEFAULT_LISTEN_SECONDS
     } else {
-        let parsed = args[1].parse::<u64>().unwrap_or(DEFAULT_LISTEN_SECONDS);
+        let parsed = positional[0].parse::<u64>().unwrap_or(DEFAULT_LISTEN_SECONDS);
         parsed.min(MAX_LISTEN_SECONDS)
     };
 
-    let output_dir = if let Some(arg_path) = args.get(2) {
+    let output_dir = if let Some(arg_path) = positional.get(1) {
         PathBuf::from(arg_path)
     } else if let Ok(env_path) = std::env::var("NETID_LXC_OUTPUT_DIR") {
         PathBuf::from(env_path)
@@ -430,7 +522,24 @@ fn parse_runtime_config() -> RuntimeConfig {
     RuntimeConfig {
         listen_seconds,
         output_dir,
+        banner_ports,
+        banner_timeout_ms,
     }
+}
+
+fn parse_ports_csv(input: &str) -> Vec<u16> {
+    let mut ports = input
+        .split(',')
+        .filter_map(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .collect::<Vec<_>>();
+
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.len() > MAX_BANNER_PORTS {
+        ports.truncate(MAX_BANNER_PORTS);
+    }
+    ports
 }
 
 fn ensure_output_dir(preferred: &Path) -> PathBuf {
@@ -469,9 +578,11 @@ fn print_inventory_table(records: &[DeviceRecord]) {
         "HOSTNAME",
         "VENDOR",
         "CATEGORY",
-        "CONF",
         "IFACE",
         "SERVICES",
+        "PORTS",
+        "IDENTITY",
+        "BANNER",
     ];
 
     let mut rows = Vec::new();
@@ -481,11 +592,11 @@ fn print_inventory_table(records: &[DeviceRecord]) {
         let hostname = pick_first_or_dash(&record.observed_hostnames);
         let vendor = record.vendor.clone().unwrap_or_else(|| "-".to_string());
         let category = record.category.clone();
-        let confidence = record.confidence.clone();
         let iface = record.interface.clone().unwrap_or_else(|| "-".to_string());
 
         let mut services = record.observed_mdns_services.clone();
         services.extend(record.observed_ssdp_services.clone());
+        services.extend(record.observed_service_hints.clone());
         services.sort();
         services.dedup();
         let service_text = if services.is_empty() {
@@ -494,10 +605,36 @@ fn print_inventory_table(records: &[DeviceRecord]) {
             services.join(",")
         };
 
-        rows.push(vec![ip, mac, hostname, vendor, category, confidence, iface, service_text]);
+        let port_text = if record.observed_open_ports.is_empty() {
+            "-".to_string()
+        } else {
+            record
+                .observed_open_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let identity = pick_first_or_dash(&record.observed_identity_hints);
+
+        let banner = pick_first_or_dash(&record.observed_tcp_banners);
+
+        rows.push(vec![
+            ip,
+            mac,
+            hostname,
+            vendor,
+            category,
+            iface,
+            service_text,
+            port_text,
+            identity,
+            banner,
+        ]);
     }
 
-    let max_widths = [15usize, 17, 24, 18, 18, 6, 10, 26];
+    let max_widths = [15usize, 17, 24, 18, 18, 10, 22, 16, 22, 32];
     let mut widths = headers
         .iter()
         .enumerate()
@@ -563,9 +700,273 @@ fn pick_first_or_dash(values: &[String]) -> String {
     values.first().cloned().unwrap_or_else(|| "-".to_string())
 }
 
-fn estimate_runtime_seconds(listen_seconds: u64, interface_count: usize) -> u64 {
+fn estimate_runtime_seconds(listen_seconds: u64, interface_count: usize, banner_port_count: usize) -> u64 {
     let interface_overhead = (interface_count as u64).min(6);
-    listen_seconds + interface_overhead + 8
+    let banner_overhead = if banner_port_count == 0 {
+        0
+    } else {
+        ((banner_port_count as u64).min(10) * 2).max(4)
+    };
+    listen_seconds + interface_overhead + 8 + banner_overhead
+}
+
+#[derive(Debug, Default)]
+struct BannerStats {
+    targets: usize,
+    attempts: usize,
+    banners: usize,
+}
+
+#[derive(Debug)]
+struct TcpProbeObservation {
+    banner: Option<String>,
+    service_hints: Vec<String>,
+    identity_hints: Vec<String>,
+    open: bool,
+}
+
+fn collect_tcp_banners(inventory: &mut Inventory, ports: &[u16], timeout: Duration) -> BannerStats {
+    if ports.is_empty() {
+        return BannerStats::default();
+    }
+
+    let mut target_ips = inventory
+        .devices
+        .iter()
+        .flat_map(|device| device.ips.iter().copied())
+        .collect::<Vec<_>>();
+    target_ips.sort();
+    target_ips.dedup();
+    if target_ips.len() > MAX_BANNER_TARGETS {
+        target_ips.truncate(MAX_BANNER_TARGETS);
+    }
+
+    let mut stats = BannerStats {
+        targets: target_ips.len(),
+        attempts: 0,
+        banners: 0,
+    };
+
+    for ip in target_ips {
+        for port in ports {
+            stats.attempts += 1;
+            let Some(observation) = probe_tcp_banner(ip, *port, timeout) else {
+                continue;
+            };
+
+            if let Some(index) = inventory.find_by_ip_or_mac(Some(ip), None) {
+                let device = &mut inventory.devices[index];
+                if observation.open {
+                    device.open_ports.insert(*port);
+                }
+
+                for hint in observation.service_hints {
+                    device.service_hints.insert(hint);
+                }
+
+                for hint in observation.identity_hints {
+                    device.identity_hints.insert(hint);
+                }
+
+                if let Some(banner) = observation.banner {
+                    device.tcp_banners.insert(format!("tcp/{port}: {banner}"));
+                    stats.banners += 1;
+                }
+
+                device.sources.insert("tcp_banner".to_string());
+            }
+        }
+    }
+
+    stats
+}
+
+fn probe_tcp_banner(ip: Ipv4Addr, port: u16, timeout: Duration) -> Option<TcpProbeObservation> {
+    let endpoint = SocketAddr::new(IpAddr::V4(ip), port);
+    let mut stream = TcpStream::connect_timeout(&endpoint, timeout).ok()?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    if matches!(port, 80 | 8000 | 8080 | 8888) {
+        let request = format!(
+            "GET / HTTP/1.0\\r\\nHost: {}\\r\\nUser-Agent: netid-lxc\\r\\n\\r\\n",
+            ip
+        );
+        let _ = stream.write_all(request.as_bytes());
+    }
+
+    let mut buffer = [0u8; 320];
+    let payload = match stream.read(&mut buffer) {
+        Ok(size) if size > 0 => Some(sanitize_banner_bytes(&buffer[..size])),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => None,
+        Err(_) => None,
+    };
+
+    let mut service_hints = infer_service_hints(port, payload.as_deref());
+    service_hints.sort();
+    service_hints.dedup();
+
+    let mut identity_hints = infer_identity_hints(payload.as_deref());
+    identity_hints.sort();
+    identity_hints.dedup();
+
+    Some(TcpProbeObservation {
+        banner: payload,
+        service_hints,
+        identity_hints,
+        open: true,
+    })
+}
+
+fn infer_service_hints(port: u16, banner: Option<&str>) -> Vec<String> {
+    let mut hints = Vec::new();
+    match port {
+        21 => hints.push("ftp".to_string()),
+        22 => hints.push("ssh".to_string()),
+        23 => hints.push("telnet".to_string()),
+        25 | 587 => hints.push("smtp".to_string()),
+        53 => hints.push("dns".to_string()),
+        80 | 8080 | 8000 | 8888 => hints.push("http".to_string()),
+        110 => hints.push("pop3".to_string()),
+        143 => hints.push("imap".to_string()),
+        443 => hints.push("https/tls".to_string()),
+        445 => hints.push("smb".to_string()),
+        554 => hints.push("rtsp".to_string()),
+        631 => hints.push("ipp".to_string()),
+        9100 => hints.push("raw-printer".to_string()),
+        _ => {}
+    }
+
+    if let Some(text) = banner {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("ssh-") {
+            hints.push("ssh".to_string());
+        }
+        if lower.contains("ftp") {
+            hints.push("ftp".to_string());
+        }
+        if lower.contains("smtp") || lower.contains("esmtp") {
+            hints.push("smtp".to_string());
+        }
+        if lower.contains("http/") || lower.contains("server:") {
+            hints.push("http".to_string());
+        }
+        if lower.contains("rtsp") {
+            hints.push("rtsp".to_string());
+        }
+    }
+
+    hints
+}
+
+fn infer_identity_hints(banner: Option<&str>) -> Vec<String> {
+    let Some(text) = banner else {
+        return Vec::new();
+    };
+
+    let mut hints = Vec::new();
+    if let Some(server) = extract_http_header(text, "server") {
+        hints.push(format!("http_server:{server}"));
+    }
+    if let Some(realm) = extract_http_realm(text) {
+        hints.push(format!("http_realm:{realm}"));
+    }
+    if let Some(title) = extract_http_title(text) {
+        hints.push(format!("http_title:{title}"));
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let signatures = [
+        "synology",
+        "qnap",
+        "hikvision",
+        "dahua",
+        "ubiquiti",
+        "mikrotik",
+        "tplink",
+        "tp-link",
+        "netgear",
+        "asus",
+        "brother",
+        "hp",
+        "canon",
+        "epson",
+        "samsung",
+        "axis",
+        "unifi",
+        "home assistant",
+    ];
+
+    for sig in signatures {
+        if lower.contains(sig) {
+            hints.push(format!("signature:{sig}"));
+        }
+    }
+
+    hints
+}
+
+fn extract_http_header(payload: &str, header_name: &str) -> Option<String> {
+    let wanted = format!("{}:", header_name.to_ascii_lowercase());
+    for line in payload.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with(&wanted) {
+            let value = trimmed.split_once(':')?.1.trim();
+            if !value.is_empty() {
+                return Some(clip(value, 64));
+            }
+        }
+    }
+    None
+}
+
+fn extract_http_realm(payload: &str) -> Option<String> {
+    let lower = payload.to_ascii_lowercase();
+    let marker = "realm=\"";
+    let start = lower.find(marker)? + marker.len();
+    let end_rel = lower[start..].find('"')?;
+    let end = start + end_rel;
+    let realm = payload.get(start..end)?.trim();
+    if realm.is_empty() {
+        None
+    } else {
+        Some(clip(realm, 48))
+    }
+}
+
+fn extract_http_title(payload: &str) -> Option<String> {
+    let re = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").ok()?;
+    let captures = re.captures(payload)?;
+    let raw = captures.get(1)?.as_str();
+    let clean = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clip(&clean, 64))
+    }
+}
+
+fn sanitize_banner_bytes(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_graphic() || ch == ' ' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "open".to_string()
+    } else {
+        clip(&compact, 120)
+    }
 }
 
 fn now_iso() -> String {
@@ -1312,45 +1713,15 @@ fn run_command(binary: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn classify_device(device: &DeviceBuilder) -> (String, String, Vec<String>) {
-    let has_dhcp_hostname = device.sources.contains("dhcp_hostname");
-    let has_mdns_identity = device.sources.contains("mdns_hostname") || device.sources.contains("mdns_instance");
-    let has_neighbor_mac = device.sources.contains("neighbor_mac") || !device.macs.is_empty();
-
-    let mut evidence = Vec::new();
-    if has_dhcp_hostname {
-        evidence.push("dhcp_hostname".to_string());
-    }
-    if has_mdns_identity {
-        evidence.push("mdns_identity".to_string());
-    }
-    if has_neighbor_mac {
-        evidence.push("neighbor_mac".to_string());
-    }
-    if device.vendor.is_some() {
-        evidence.push("oui_vendor".to_string());
-    }
-
-    let category = infer_category(device);
-
-    let confidence = if has_dhcp_hostname && has_mdns_identity && has_neighbor_mac {
-        "high".to_string()
-    } else if (!device.mdns_services.is_empty() || !device.ssdp_services.is_empty()) && device.vendor.is_some() {
-        evidence.push("service_plus_vendor".to_string());
-        "medium".to_string()
-    } else {
-        "low".to_string()
-    };
-
-    (category, confidence, evidence)
-}
-
 fn infer_category(device: &DeviceBuilder) -> String {
     let mut hints = Vec::new();
     hints.extend(device.hostnames.iter().map(|h| h.to_ascii_lowercase()));
     hints.extend(device.instances.iter().map(|h| h.to_ascii_lowercase()));
     hints.extend(device.mdns_services.iter().map(|h| h.to_ascii_lowercase()));
     hints.extend(device.ssdp_services.iter().map(|h| h.to_ascii_lowercase()));
+    hints.extend(device.service_hints.iter().map(|h| h.to_ascii_lowercase()));
+    hints.extend(device.identity_hints.iter().map(|h| h.to_ascii_lowercase()));
+    hints.extend(device.tcp_banners.iter().map(|h| h.to_ascii_lowercase()));
     if let Some(vendor) = &device.vendor {
         hints.push(vendor.to_ascii_lowercase());
     }
@@ -1415,5 +1786,11 @@ mod tests {
             extract_service_type("My-Printer._ipp._tcp.local"),
             Some("_ipp._tcp".to_string())
         );
+    }
+
+    #[test]
+    fn parses_banner_ports_csv() {
+        let ports = parse_ports_csv("80,443,21, 80, 0, abc");
+        assert_eq!(ports, vec![21, 80, 443]);
     }
 }

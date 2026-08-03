@@ -49,6 +49,14 @@ Terminal output is a readable table. JSON is saved as:
 - `/var/lib/netid-lxc/output/latest.json`
 - `/var/lib/netid-lxc/output/run-YYYYMMDD-HHMMSS.json`
 
+Optional TCP banner enrichment example:
+
+```bash
+/usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output --banner-ports 21,22,80,443,445,554,631,8080 --banner-timeout-ms 700
+```
+
+This enrichment adds open ports, service hints, identity hints, and raw banner snippets to JSON output and terminal table columns.
+
 ## Run via systemd
 
 ```bash

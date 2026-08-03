@@ -1,6 +1,6 @@
 # NetID-LXC
 
-A quiet Rust-based Linux LAN inventory tool designed for Proxmox LXC environments. The binary performs passive discovery only (no active probing), correlates local network evidence, and outputs a JSON device inventory with confidence scoring.
+A quiet Rust-based Linux LAN inventory tool designed for Proxmox LXC environments. By default the binary uses passive discovery (no active probing), with optional TCP banner enrichment against already-discovered IPs.
 
 ## Features
 
@@ -10,7 +10,9 @@ A quiet Rust-based Linux LAN inventory tool designed for Proxmox LXC environment
 - Parses local DHCP lease/log state for host hints
 - Performs passive mDNS/DNS-SD listening (and optional SSDP capture) for up to 60s
 - Performs limited reverse DNS only for already-seen IP addresses
-- Classifies devices with confidence scoring and contributing evidence
+- Classifies likely device categories from passive evidence
+- Optional low-noise TCP banner enrichment for discovered IPs (for example ports 21/22/80/443)
+- Extracts open port lists, service hints, and identity hints from banner/protocol responses
 - Builds as a small Linux container image
 
 ## Passive workflow summary
@@ -21,10 +23,12 @@ A quiet Rust-based Linux LAN inventory tool designed for Proxmox LXC environment
 4. Parse local DHCP lease/client state
 5. Passive mDNS/DNS-SD and SSDP listening (max 60s)
 6. Limited reverse DNS hints (timeouts + capped concurrency)
-7. Confidence-scored device classification
+7. Category classification from passive evidence
 
 The program prints stage progress so you can see active interfaces, estimated runtime, and keep-alive progress while passive listening is running.
 At completion, the terminal prints an easy-to-read device table and writes full JSON into an output directory.
+
+You can optionally enable TCP banner enrichment, which performs TCP connect attempts only against already-discovered IPs.
 
 ## Output schema (per device)
 
@@ -35,10 +39,12 @@ At completion, the terminal prints an easy-to-read device table and writes full 
 - observed_instances
 - observed_mdns_services
 - observed_ssdp_services
+- observed_tcp_banners
+- observed_open_ports
+- observed_service_hints
+- observed_identity_hints
 - vendor
 - category
-- confidence
-- confidence_sources
 - first_seen
 - last_seen
 
@@ -61,6 +67,15 @@ Optional second argument sets JSON output directory:
 ```bash
 ./target/release/netid-lxc 30 ./output
 ```
+
+Optional banner probe command (connects to discovered IPs only):
+
+```bash
+./target/release/netid-lxc 30 ./output --banner-ports 21,22,80,443,445,554,631,8080 --banner-timeout-ms 700
+```
+
+- `--banner-ports`: comma-separated TCP ports to probe
+- `--banner-timeout-ms`: per-connection timeout (100 to 3000 ms, default 500)
 
 Default output directory is `/var/lib/netid-lxc/output` with fallback to `./output` if the preferred path is not writable.
 
@@ -91,6 +106,12 @@ For manual execution inside the container:
 
 ```bash
 /usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output
+```
+
+With optional banner enrichment:
+
+```bash
+/usr/local/bin/netid-lxc 30 /var/lib/netid-lxc/output --banner-ports 21,22,80,443,445,554,631,8080 --banner-timeout-ms 700
 ```
 
 ## Deploy as a Proxmox container (LXC)
